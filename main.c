@@ -24,6 +24,31 @@ int main(){
 		__enable_irq(); // Enable interrupts
 		uart_print("\r\n"); // Print newline
 	
+		while(1){
+				buff_index = 0; // Reset buffer index
+
+				uart_print("\r\nEnter number: ");
+				do {
+						// Wait until a character is received in the queue
+						while (!queue_dequeue(&rx_queue, &rx_char))
+								__WFI(); // Wait for Interrupt
+
+								if (rx_char == 0x7F) { // Handle backspace character
+										if (buff_index > 0) {
+												buff_index--; // Move buffer index back
+												uart_tx(rx_char); // Send backspace character to erase on terminal
+										}
+								} else {
+										// Store and echo the received character back
+										buff[buff_index++] = (char)rx_char; // Store character in buffer
+										uart_tx(rx_char); // Echo character back to terminal
+								}
+				} while (rx_char != '\r' && buff_index < BUFF_SIZE); // Continue until Enter key or buffer full
+		
+				
+		
+		}
+		
 }
 
 
