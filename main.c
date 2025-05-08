@@ -278,10 +278,10 @@ void button_isr(int status) {
         char message[64];
         if (!led_enabled) {
             // Disable LED actions
-            sprintf(message, "\r\nLED locked. Count = %lu\r\n", button_press_count);
+            sprintf(message, "\r\nLED locked. Count = %u\r\n", button_press_count);
         } else {
             // Re-enable LED actions
-            sprintf(message, "\r\nLED functionality restored. Count = %lu\r\n", button_press_count);
+            sprintf(message, "\r\nLED functionality restored. Count = %u\r\n", button_press_count);
             // Re-analyze current digit to restore LED behavior
             analyze_current_digit();
         }
