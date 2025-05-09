@@ -30,7 +30,7 @@ bool new_input_available = false; // Flag to indicate new input is available
 
 // Function prototypes
 void uart_rx_isr(uint8_t rx);
-void button_isr(int status);
+void button_isr();
 void timer_digit_analysis_callback(void);
 void start_digit_analysis(void);
 void analyze_current_digit(void);
@@ -45,20 +45,49 @@ int main() {
     // Initialize the receive queue and UART
     queue_init(&rx_queue, 128);
     uart_init(115200);
+  
     uart_set_rx_callback(uart_rx_isr); // Set the UART receive callback function
     uart_enable(); // Enable UART module
+    uart_print("\r\nUART enabled\r\n");
     
+    uart_print("\r\n*** Digit Analysis System ***\r\n");
     // Initialize LEDs and button
     leds_init();
-    gpio_set_mode(BUTTON_PIN, Input);
+    uart_print("LEDs initialized\r\n");
+    
+    // Setup the on-board button (PC_13)
+    // The on-board button is active-low (connects to ground when pressed)
+    gpio_set_mode(BUTTON_PIN, PullUp);  // Use pull-up since button is active-low
+    uart_print("Button mode set to PullUp\r\n");
+    
+    // Use Falling edge trigger since button is active-low
     gpio_set_trigger(BUTTON_PIN, Falling);
+    uart_print("Button trigger set to Falling\r\n");
+    
+    // Set the callback function
     gpio_set_callback(BUTTON_PIN, button_isr);
+    uart_print("Button callback set\r\n");
     
-    // Initialize timers
-    timer_init(1000); // Initialize with 1ms base time
+    // Initialize timer with proper sequence to avoid race conditions
+    uart_print("Initializing timer...\r\n");
     
-    // Enable global interrupts
+    // Make sure is_analyzing is false to prevent premature analysis
+    is_analyzing = false;
+    
+    // Initialize with 1ms interval
+    timer_init(1000);
+    
+    // Set the callback before enabling interrupts
+    // If we don't, we end up with a race condition where the timer interrupt
+    // might occur before the callback is set.
+    timer_set_callback(timer_digit_analysis_callback);
+    
+    uart_print("Timer initialized\r\n");
+    
+    // Enable global interrupts - do this only once
+    uart_print("Enabling global interrupts\r\n");
     __enable_irq();
+    uart_print("Global interrupts enabled\r\n");
     
     uart_print("\r\n*** Digit Analysis System ***\r\n");
     
@@ -77,17 +106,11 @@ int main() {
             // Wait until a character is received in the queue
             while (!queue_dequeue(&rx_queue, &rx_char))
                 __WFI(); // Wait for Interrupt
-
-            if (rx_char == 0x7F) { // Handle backspace character
-                if (buff_index > 0) {
-                    buff_index--; // Move buffer index back
-                    uart_tx(rx_char); // Send backspace character to erase on terminal
-                }
-            } else {
-                // Store and echo the received character back
-                buff[buff_index++] = (char)rx_char; // Store character in buffer
-                uart_tx(rx_char); // Echo character back to terminal
-            }
+            
+            // Store and echo the received character back
+            buff[buff_index++] = (char)rx_char; // Store character in buffer
+            uart_tx(rx_char); // Echo character back to terminal
+            
         } while (rx_char != '\r' && buff_index < BUFF_SIZE); // Continue until Enter key or buffer full
         
         // Replace the last character with null terminator to make it a valid C string
@@ -156,15 +179,16 @@ void start_digit_analysis(void) {
     led_enabled = true;
     is_analyzing = true;
     
-    // Turn off LED initially
-    set_led(false);
-    
-    // Set up and start the timer with our callback
-    timer_set_callback(timer_digit_analysis_callback);
-    timer_enable();
-    
     // Analyze the first digit immediately
     analyze_current_digit();
+    
+    // Enable the timer to handle subsequent digits
+    // The callback was already set during initialization
+    uart_print("Enabling timer...\r\n");
+    timer_enable();
+    
+    // The timer will handle subsequent digits and completion
+    uart_print("\r\nTimer-based analysis started\r\n");
 }
 
 // Analyze the current digit
@@ -180,7 +204,7 @@ void analyze_current_digit(void) {
     int digit_value = digit - '0';
     
     char message[64];
-    sprintf(message, "\r\nAnalyzing digit %lu: %c (%s)\r\n", 
+    sprintf(message, "\r\nAnalyzing digit %u: %c (%s)\r\n", 
             current_digit_index + 1, digit, (digit_value % 2 == 0) ? "even" : "odd");
     uart_print(message);
     
@@ -188,15 +212,16 @@ void analyze_current_digit(void) {
     
     if (led_enabled) {
         if (digit_value % 2 == 0) {
-            // Even digit: LED blinks every 200ms
-            uart_print("LED will blink every 200ms\r\n");
+            // Even digit: LED blinks continuously every 200ms
+            uart_print("LED will blink continuously every 200ms\r\n");
+            // Reset blink counter for consistent timing
             blink_counter = 0;
-            // We'll handle blinking in the main loop
+            // The actual blinking is handled in the timer callback
         } else {
             // Odd digit: LED toggles and stays steady
-            led_state = !led_state;
-            set_led(led_state);
-            sprintf(message, "LED toggled to %s\r\n", led_state ? "ON" : "OFF");
+            bool new_state = !led_state;
+            set_led(new_state);
+            sprintf(message, "LED toggled to %s\r\n", new_state ? "ON" : "OFF");
             uart_print(message);
         }
     } else {
@@ -208,6 +233,11 @@ void analyze_current_digit(void) {
 void timer_digit_analysis_callback(void) {
     static uint32_t ms_counter = 0;
     
+    // Only process timer callback if we're actually analyzing
+    // This prevents the "Analysis complete" message at startup
+    if (!is_analyzing) {
+        return;
+    }    
     // Check if new input is available - if so, disable timer and return
     if (new_input_available) {
         timer_disable();
@@ -232,7 +262,7 @@ void timer_digit_analysis_callback(void) {
                 // Analysis complete
                 timer_disable();
                 is_analyzing = false;
-                uart_print("\r\nAnalysis complete.\r\n");
+                // Message will be printed in the main loop
                 return;
             }
         } else {
@@ -247,17 +277,17 @@ void timer_digit_analysis_callback(void) {
         int digit_value = digit - '0';
         
         if (digit_value % 2 == 0) {
-            // Only blink if the current digit is even
-            if ((ms_counter % LED_BLINK_MS) == 0) {
+            // Blink continuously for even digits
+            // Check if it's time to toggle the LED (every LED_BLINK_MS milliseconds)
+            if (ms_counter % LED_BLINK_MS == 0) {
+                // Toggle LED state
                 led_state = !led_state;
                 set_led(led_state);
                 
-                // Only print LED state changes when they occur
-                if (led_state) {
-                    uart_print("LED ON\r\n");
-                } else {
-                    uart_print("LED OFF\r\n");
-                }
+                // Print LED state change with timestamp
+                char message[32];
+                sprintf(message, "[%u ms] LED %s\r\n", ms_counter, led_state ? "ON" : "OFF");
+                uart_print(message);
             }
         }
     }
@@ -266,46 +296,57 @@ void timer_digit_analysis_callback(void) {
 // This function is no longer needed as blinking is handled in the timer_digit_analysis_callback
 
 // Button interrupt service routine
-void button_isr(int status) {
-    // The status parameter contains which pin triggered the interrupt
-    // We only care about our button pin
-    
+void button_isr() {
+    // Increment button press counter
     button_press_count++;
     
+    // If we're analyzing, toggle LED functionality
     if (is_analyzing) {
         led_enabled = !led_enabled;
         
-        char message[64];
         if (!led_enabled) {
             // Disable LED actions
-            sprintf(message, "\r\nLED locked. Count = %u\r\n", button_press_count);
+            uart_print("\r\nLED locked. Button press count = ");
+            char count_str[16];
+            sprintf(count_str, "%u\r\n", button_press_count);
+            uart_print(count_str);
         } else {
             // Re-enable LED actions
-            sprintf(message, "\r\nLED functionality restored. Count = %u\r\n", button_press_count);
+            uart_print("\r\nLED functionality restored. Button press count = ");
+            char count_str[16];
+            sprintf(count_str, "%u\r\n", button_press_count);
+            uart_print(count_str);
+            
             // Re-analyze current digit to restore LED behavior
             analyze_current_digit();
         }
-        uart_print(message);
+    } else {
+        // Just print the button press count if no analysis is in progress
+        uart_print("\r\nButton pressed. Count = ");
+        char count_str[16];
+        sprintf(count_str, "%u\r\n", button_press_count);
+        uart_print(count_str);
     }
 }
 
-// Set LED state and handle hardware control
+// Set LED state
 void set_led(bool state) {
     led_state = state;
-    // Use red LED only for our blinking/toggling
     leds_set(state, 0, 0);
 }
 
 // Interrupt Service Routine for UART receive
 void uart_rx_isr(uint8_t rx) {
     // Check if the received character is a printable ASCII character
-    if (rx >= 0x0 && rx <= 0x7F) {
+    if (rx >= 0x20 && rx <= 0x7E || rx == '\r') { // Only accept printable chars and Enter
         // Store the received character
         queue_enqueue(&rx_queue, rx);
         
-        // If we're currently analyzing, signal that new input is available
-        if (is_analyzing && rx == '\r') {
+        // If we're currently analyzing, signal that new input is available as soon as any key is pressed
+        // This allows immediate interruption of the analysis
+        if (is_analyzing) {
             new_input_available = true;
+            uart_print("\r\nNew input detected, stopping current analysis...\r\n");
         }
     }
 }
