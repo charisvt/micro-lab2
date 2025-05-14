@@ -1,352 +1,399 @@
-#include "platform.h"
+#include "main.h"
 #include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include "uart.h"
 #include <string.h>
-#include "queue.h"
-#include "timer.h"
-#include "gpio.h"
-#include "leds.h"
 
-#define BUFF_SIZE 128       // Read buffer length
-#define BUTTON_PIN PC_13      // Button pin (adjust as needed for your board)
-#define DIGIT_ANALYSIS_MS 500  // Time between digit analysis (0.5s)
-#define LED_BLINK_MS 200    // LED blink period for even digits
+// Definitions
+#define BUFF_SIZE 128
+#define BUTTON_PIN PC_13
+#define DIGIT_ANALYSIS_INTERVAL_MS 500
+#define LED_BLINK_INTERVAL_MS 200
 
-// Global variables
-Queue rx_queue;             // Queue for storing received characters
-char input_number[BUFF_SIZE]; // Store the input number
-uint32_t current_digit_index = 0; // Current digit being analyzed
-uint32_t input_length = 0;   // Length of the input number
-bool led_state = false;     // Current LED state (on/off)
-bool led_enabled = true;    // Whether LED actions are enabled
-uint32_t button_press_count = 0; // Count of button presses
-bool is_analyzing = false;  // Flag to indicate if analysis is in progress
-uint32_t blink_counter = 0; // Counter for LED blinking
-bool continuous_mode = false; // Flag for continuous analysis mode (number ending with '-')
-bool new_input_available = false; // Flag to indicate new input is available
+// Application States
+typedef enum {
+    APP_STATE_INIT,
+    APP_STATE_IDLE,
+    APP_STATE_RECEIVING_INPUT,
+    APP_STATE_START_ANALYSIS,
+    APP_STATE_ANALYZING_DIGIT,
+    APP_STATE_CONTINUOUS_BLINK 
+} AppState;
 
-// Function prototypes
-void uart_rx_isr(uint8_t rx);
-void button_isr();
-void timer_digit_analysis_callback(void);
-void start_digit_analysis(void);
-void analyze_current_digit(void);
-void set_led(bool state);
+// Global state variables
+static AppState current_app_state = APP_STATE_INIT;
+static bool continuous_mode_active = false;
+static bool lock_message_was_printed = false;
 
-int main() {
-    // Variables to help with UART read
-    uint8_t rx_char = 0;
-    char buff[BUFF_SIZE];
-    uint32_t buff_index;
+// Input Buffers
+static Queue rx_queue;
+static char input_buffer[BUFF_SIZE];
+static uint8_t input_buffer_idx = 0;
+static char processed_number[BUFF_SIZE];
+static uint8_t processed_number_len = 0;
+static uint8_t current_digit_idx = 0;
 
-    // Initialize the receive queue and UART
-    queue_init(&rx_queue, 128);
-    uart_init(115200);
-  
-    uart_set_rx_callback(uart_rx_isr); // Set the UART receive callback function
-    uart_enable(); // Enable UART module
-    uart_print("\r\nUART enabled\r\n");
+// LED & Button Status
+static bool led_current_state_on = false;
+static bool led_should_blink = false;
+static uint32_t button_press_counter = 0;
+static bool led_frozen = false;
+
+// Timer Counters
+static volatile uint32_t system_ms_counter = 0; // Incremented by 1ms timer ISR
+static uint32_t last_digit_analysis_time = 0;
+static uint32_t last_led_blink_time = 0;
+
+// Event Flags (set by ISRs, cleared by main loop)
+static volatile bool uart_char_received_flag = false;
+static volatile uint8_t received_uart_char = 0;
+static volatile bool button_pressed_flag = false;
+static volatile bool new_input_interrupt_flag = false; // If new input during analysis
+
+// Function Prototypes for State Handlers
+static void handle_init_state(void);
+static void handle_idle_state(void);
+static void handle_receiving_input_state(void);
+static void handle_start_analysis_state(void);
+static void handle_analyzing_digit_state(void);
+static void handle_continuous_blink_state(void);
+
+// Helper Functions
+static void set_led_output(bool on);
+static void process_received_char(uint8_t c);
+static void filter_and_prepare_number(void);
+static void initiate_digit_analysis(void);
+static void perform_current_digit_analysis(void);
+static void reset_for_new_input(void);
+
+// ISRs
+void timer_1ms_callback(void) { // Assuming a 1ms timer is configured
+    system_ms_counter++;
+    // Flags for specific intervals can be set here if needed, or checked in main loop
+}
+
+void uart_rx_isr(uint8_t rx_data) {
+    if (queue_is_full(&rx_queue)) { // Or however you check queue full
+        // Optional: Handle queue full error, maybe log or ignore
+        return;
+    }
+    queue_enqueue(&rx_queue, rx_data); // Enqueue the character
+    uart_char_received_flag = true;    // Signal main loop
+
+    // If analysis or blinking is active, new UART input is an interruption
+    if (current_app_state == APP_STATE_ANALYZING_DIGIT || 
+        current_app_state == APP_STATE_CONTINUOUS_BLINK) {
+        new_input_interrupt_flag = true;
+    }
+}
+
+void button_isr(int status) {
+    button_pressed_flag = true;
+}
+
+int main(void) {
     
-    uart_print("\r\n*** Digit Analysis System ***\r\n");
-    // Initialize LEDs and button
-    leds_init();
-    uart_print("LEDs initialized\r\n");
-    
-    // Setup the on-board button (PC_13)
-    // The on-board button is active-low (connects to ground when pressed)
-    gpio_set_mode(BUTTON_PIN, PullUp);  // Use pull-up since button is active-low
-    uart_print("Button mode set to PullUp\r\n");
-    
-    // Use Falling edge trigger since button is active-low
-    gpio_set_trigger(BUTTON_PIN, Falling);
-    uart_print("Button trigger set to Falling\r\n");
-    
-    // Set the callback function
+    // Initialize Peripherals
+    queue_init(&rx_queue, 128); // Initialize RX queue
+    uart_init(115200);          // Initialize UART
+    uart_set_rx_callback(uart_rx_isr);
+    uart_enable();
+
+    leds_init(); // Initialize LEDs
+
+    gpio_set_mode(BUTTON_PIN, PullUp);      // Button with pull-up
+    gpio_set_trigger(BUTTON_PIN, Rising);  // Trigger on rising edge or we get weird bug
     gpio_set_callback(BUTTON_PIN, button_isr);
-    uart_print("Button callback set\r\n");
     
-    // Initialize timer with proper sequence to avoid race conditions
-    uart_print("Initializing timer...\r\n");
-    
-    // Make sure is_analyzing is false to prevent premature analysis
-    is_analyzing = false;
-    
-    // Initialize with 1ms interval
-    timer_init(1000);
-    
-    // Set the callback before enabling interrupts
-    // If we don't, we end up with a race condition where the timer interrupt
-    // might occur before the callback is set.
-    timer_set_callback(timer_digit_analysis_callback);
-    
-    uart_print("Timer initialized\r\n");
-    
-    // Enable global interrupts - do this only once
-    uart_print("Enabling global interrupts\r\n");
-    __enable_irq();
-    uart_print("Global interrupts enabled\r\n");
-    
-    uart_print("\r\n*** Digit Analysis System ***\r\n");
-    
-    while(1) {
-        // Reset for new input
-        buff_index = 0;
-        led_enabled = true;
-        is_analyzing = false;
-        continuous_mode = false;
-        new_input_available = false;
-        
-        uart_print("\r\nEnter number: ");
-        
-        // Get input from UART
-        do {
-            // Wait until a character is received in the queue
-            while (!queue_dequeue(&rx_queue, &rx_char))
-                __WFI(); // Wait for Interrupt
-            
-            // Store and echo the received character back
-            buff[buff_index++] = (char)rx_char; // Store character in buffer
-            uart_tx(rx_char); // Echo character back to terminal
-            
-        } while (rx_char != '\r' && buff_index < BUFF_SIZE); // Continue until Enter key or buffer full
-        
-        // Replace the last character with null terminator to make it a valid C string
-        buff[buff_index - 1] = '\0';
-        uart_print("\r\n"); // Print newline
-        
-        // Check if buffer overflow occurred
-        if (buff_index >= BUFF_SIZE) {
-            uart_print("Buffer overflow detected! Please enter a shorter number.\r\n");
-            continue;
-        }
-        
-        // Process the input, filtering out non-numeric characters except for trailing '-'
-        uint32_t valid_index = 0;
-        for (uint32_t i = 0; i < buff_index - 1; i++) {
-            // Check for trailing '-' which indicates continuous mode
-            if (buff[i] == '-' && i == buff_index - 2) {
-                continuous_mode = true;
-                break;
-            }
-            // Only keep numeric characters
-            else if (buff[i] >= '0' && buff[i] <= '9') {
-                input_number[valid_index++] = buff[i];
-            }
-            // Ignore other characters
-        }
-        
-        // Null-terminate the filtered input
-        input_number[valid_index] = '\0';
-        input_length = valid_index;
-        
-        if (input_length == 0) {
-            uart_print("Invalid input. Please enter at least one digit.\r\n");
-            continue;
-        }
-        
-        // Start the digit analysis
-        uart_print("Starting digit analysis...\r\n");
-        if (continuous_mode) {
-            uart_print("Continuous mode activated (number ends with '-').\r\n");
-            uart_print("Enter a new number to stop.\r\n");
-        }
-        
-        start_digit_analysis();
-        
-        // Wait for analysis to complete or new input
-        while (is_analyzing && !new_input_available) {
-            __WFI(); // Wait for Interrupt
-        }
-        
-        if (new_input_available) {
-            uart_print("Analysis interrupted by new input.\r\n");
-            // Stop the timer to halt the current analysis
-            timer_disable();
-            is_analyzing = false;
-        } else if (!continuous_mode) {
-            uart_print("Analysis complete.\r\n");
-        }
-    }
-}
+    NVIC_SetPriority(EXTI15_10_IRQn, 0); 
 
-// Start the digit analysis process
-void start_digit_analysis(void) {
-    current_digit_index = 0;
-    button_press_count = 0;
-    led_enabled = true;
-    is_analyzing = true;
-    
-    // Analyze the first digit immediately
-    analyze_current_digit();
-    
-    // Enable the timer to handle subsequent digits
-    // The callback was already set during initialization
-    uart_print("Enabling timer...\r\n");
+    // Initialize a 1ms system timer
+    timer_init(1000); // 1000us = 1ms interval
+    timer_set_callback(timer_1ms_callback);
     timer_enable();
-    
-    // The timer will handle subsequent digits and completion
-    uart_print("\r\nTimer-based analysis started\r\n");
-}
 
-// Analyze the current digit
-void analyze_current_digit(void) {
-    if (current_digit_index >= input_length) {
-        // Analysis complete
-        timer_disable(); // Stop timer
-        is_analyzing = false;
-        return;
-    }
-    
-    char digit = input_number[current_digit_index];
-    int digit_value = digit - '0';
-    
-    char message[64];
-    sprintf(message, "\r\nAnalyzing digit %u: %c (%s)\r\n", 
-            current_digit_index + 1, digit, (digit_value % 2 == 0) ? "even" : "odd");
-    uart_print(message);
-    
-    // We'll use the single timer for both digit analysis and LED blinking
-    
-    if (led_enabled) {
-        if (digit_value % 2 == 0) {
-            // Even digit: LED blinks continuously every 200ms
-            uart_print("LED will blink continuously every 200ms\r\n");
-            // Reset blink counter for consistent timing
-            blink_counter = 0;
-            // The actual blinking is handled in the timer callback
-        } else {
-            // Odd digit: LED toggles and stays steady
-            bool new_state = !led_state;
-            set_led(new_state);
-            sprintf(message, "LED toggled to %s\r\n", new_state ? "ON" : "OFF");
-            uart_print(message);
+    __enable_irq(); // Enable global interrupts
+
+    current_app_state = APP_STATE_INIT;
+
+    while (1) {
+        if (new_input_interrupt_flag) {
+            uart_print("\r\nAnalysis interrupted by new input.\r\n");
+            uart_print("Enter number:");
+            led_should_blink = false;
+            reset_for_new_input();
+            set_led_output(false); // Explicitly turn LED off on interrupt
+            current_app_state = APP_STATE_IDLE;
+            new_input_interrupt_flag = false;
+            uint8_t temp_val;
+            while(queue_dequeue(&rx_queue, &temp_val)); // Clear queue
+            uart_char_received_flag = false; 
         }
-    } else {
-        uart_print("LED actions disabled (button pressed)\r\n");
-    }
-}
 
-// Timer interrupt for digit analysis
-void timer_digit_analysis_callback(void) {
-    static uint32_t ms_counter = 0;
-    
-    // Only process timer callback if we're actually analyzing
-    // This prevents the "Analysis complete" message at startup
-    if (!is_analyzing) {
-        return;
-    }    
-    // Check if new input is available - if so, disable timer and return
-    if (new_input_available) {
-        timer_disable();
-        is_analyzing = false;
-        return;
-    }
-    
-    ms_counter++;
-    
-    // Check if 500ms have elapsed for digit analysis
-    if (ms_counter >= DIGIT_ANALYSIS_MS) {
-        ms_counter = 0;
-        current_digit_index++;
-        
-        // Handle continuous mode (loop back to the beginning)
-        if (current_digit_index >= input_length) {
-            if (continuous_mode) {
-                current_digit_index = 0;
-                uart_print("\r\nRestarting analysis (continuous mode)...\r\n");
-                analyze_current_digit();
+        if (button_pressed_flag) {
+            button_press_counter++;
+            led_frozen = !led_frozen; // Toggle frozen state
+
+            if (led_frozen) {
+                uart_print("\r\nButton Press: LED functionality LOCKED. Press count: ");
             } else {
-                // Analysis complete
-                timer_disable();
-                is_analyzing = false;
-                // Message will be printed in the main loop
-                return;
+                uart_print("\r\nButton Press: LED functionality RESTORED. Press count: ");
+                // When unlocking, immediately apply the current logical LED state
+                // to the physical LED. set_led_output will now allow leds_set().
+                set_led_output(led_current_state_on);
             }
-        } else {
-            // Move to next digit
-            analyze_current_digit();
+            char temp_str[12];
+            sprintf(temp_str, "%lu\r\n", button_press_counter);
+            uart_print(temp_str);
+            button_pressed_flag = false;
         }
+
+        // --- State Machine Execution ---
+        switch (current_app_state) { // Switch directly on current_app_state
+            case APP_STATE_INIT:
+                handle_init_state();
+                break;
+            case APP_STATE_IDLE:
+                handle_idle_state();
+                break;
+            case APP_STATE_RECEIVING_INPUT:
+                handle_receiving_input_state();
+                break;
+            case APP_STATE_START_ANALYSIS:
+                handle_start_analysis_state();
+                break;
+            case APP_STATE_ANALYZING_DIGIT:
+                handle_analyzing_digit_state();
+                break;
+            case APP_STATE_CONTINUOUS_BLINK:
+                handle_continuous_blink_state();
+                break;
+            default:
+                // Should not happen, reset to a safe state
+                current_app_state = APP_STATE_IDLE;
+                break;
+        }
+        //__WFI();
     }
-    
-    // Handle LED blinking for even digits (every 200ms)
-    if (led_enabled && current_digit_index < input_length) {
-        char digit = input_number[current_digit_index];
-        int digit_value = digit - '0';
-        
-        if (digit_value % 2 == 0) {
-            // Blink continuously for even digits
-            // Check if it's time to toggle the LED (every LED_BLINK_MS milliseconds)
-            if (ms_counter % LED_BLINK_MS == 0) {
-                // Toggle LED state
-                led_state = !led_state;
-                set_led(led_state);
-                
-                // Print LED state change with timestamp
-                char message[32];
-                sprintf(message, "[%u ms] LED %s\r\n", ms_counter, led_state ? "ON" : "OFF");
-                uart_print(message);
+}
+
+void handle_init_state(void) {
+    uart_print("\r\n*** Digit Analysis System ***\r\n");
+    reset_for_new_input();
+    set_led_output(false); // Explicitly turn LED off during system init
+    current_app_state = APP_STATE_IDLE;
+}
+
+void handle_idle_state(void) {
+    // Check for new character from UART to start receiving input
+    // Only print prompt once when entering IDLE from a state that's not INIT (which prints its own welcome)
+    static AppState last_state_before_idle = APP_STATE_INIT;
+    if (last_state_before_idle != APP_STATE_IDLE && current_app_state == APP_STATE_IDLE) {
+        uart_print("Enter number: ");
+    }
+    last_state_before_idle = current_app_state; // Update for next cycle
+
+    if (uart_char_received_flag) {
+        current_app_state = APP_STATE_RECEIVING_INPUT;
+        // LED state is preserved from previous operation unless explicitly changed
+    }
+}
+
+void handle_receiving_input_state(void) {
+    if (uart_char_received_flag) {
+        uint8_t c;
+        if (queue_dequeue(&rx_queue, &c)) {
+            process_received_char(c); // Echoes and adds to buffer
+        }
+        uart_char_received_flag = false; // Consume the flag
+
+        if (c == '\r' || input_buffer_idx >= BUFF_SIZE -1) {
+            uart_print("\r\n");
+            filter_and_prepare_number();
+            if (processed_number_len > 0) {
+                current_app_state = APP_STATE_START_ANALYSIS;
+            } else {
+                uart_print("No valid digits entered.\r\n");
+                reset_for_new_input();
+                current_app_state = APP_STATE_IDLE; // Back to idle to re-prompt
             }
         }
     }
 }
 
-// This function is no longer needed as blinking is handled in the timer_digit_analysis_callback
+void handle_start_analysis_state(void) {
+    uart_print("Starting analysis...\r\n");
+    initiate_digit_analysis(); // Sets up current_digit_idx, calls perform_current_digit_analysis for first digit
+                               // and enables timer if needed.
+    current_app_state = APP_STATE_ANALYZING_DIGIT;
+    last_digit_analysis_time = system_ms_counter;
+    last_led_blink_time = system_ms_counter;
+}
 
-// Button interrupt service routine
-void button_isr() {
-    // Increment button press counter
-    button_press_count++;
-    
-    // If we're analyzing, toggle LED functionality
-    if (is_analyzing) {
-        led_enabled = !led_enabled;
-        
-        if (!led_enabled) {
-            // Disable LED actions
-            uart_print("\r\nLED locked. Button press count = ");
-            char count_str[16];
-            sprintf(count_str, "%u\r\n", button_press_count);
-            uart_print(count_str);
+void handle_analyzing_digit_state(void) {
+    // Check for digit analysis interval
+    if ((system_ms_counter - last_digit_analysis_time) >= DIGIT_ANALYSIS_INTERVAL_MS) {
+        current_digit_idx++;
+        if (current_digit_idx < processed_number_len) {
+            perform_current_digit_analysis();
+            last_digit_analysis_time = system_ms_counter;
+            last_led_blink_time = system_ms_counter; // Reset blink time for new digit
         } else {
-            // Re-enable LED actions
-            uart_print("\r\nLED functionality restored. Button press count = ");
-            char count_str[16];
-            sprintf(count_str, "%u\r\n", button_press_count);
-            uart_print(count_str);
-            
-            // Re-analyze current digit to restore LED behavior
-            analyze_current_digit();
+            // Analysis complete
+            uart_print("Analysis complete. \r\n");
+            if (continuous_mode_active) {
+                uart_print("Continuous mode: Restarting analysis.\r\n");
+
+                current_digit_idx = 0; // Reset for re-analysis
+
+                current_app_state = APP_STATE_START_ANALYSIS; 
+            } else if (led_should_blink) { 
+                current_app_state = APP_STATE_CONTINUOUS_BLINK;
+                 uart_print("Continuous LED blinking.\r\n");
+            } else {
+                // Analysis of a non-continuous, non-blinking number is complete.
+                // LED should remain in the state set by the last odd digit.
+                timer_disable(); // Stop the SysTick timer if it's only for analysis/blinking
+                // set_led_output(led_current_state_on); // LED is already in its final state from perform_current_digit_analysis
+                
+                // Reset necessary flags and buffers for the next input cycle, but preserve LED state.
+                input_buffer_idx = 0;
+                input_buffer[0] = '\0';
+                processed_number_len = 0;
+                processed_number[0] = '\0';
+                current_digit_idx = 0; 
+                // led_should_blink is already false
+                // continuous_mode_active is already false
+                // uart_char_received_flag and new_input_interrupt_flag will be handled by their respective logic.
+
+                current_app_state = APP_STATE_IDLE;
+                uart_print("Enter number:");
+            }
+            return; // Exit to avoid immediate blink check
+        }
+    }
+
+    // Handle LED blinking if current digit is even
+    if (led_should_blink) {
+        if ((system_ms_counter - last_led_blink_time) >= LED_BLINK_INTERVAL_MS) {
+            led_current_state_on = !led_current_state_on;
+            set_led_output(led_current_state_on);
+            last_led_blink_time = system_ms_counter;
+        }
+    }
+}
+
+void handle_continuous_blink_state(void) {
+    // This state is active when analysis is done, and last digit was even.
+    // UART or Button ISRs can interrupt this state.
+    if (led_should_blink) { // Should always be true here
+         if ((system_ms_counter - last_led_blink_time) >= LED_BLINK_INTERVAL_MS) {
+            led_current_state_on = !led_current_state_on;
+            set_led_output(led_current_state_on);
+            last_led_blink_time = system_ms_counter;
         }
     } else {
-        // Just print the button press count if no analysis is in progress
-        uart_print("\r\nButton pressed. Count = ");
-        char count_str[16];
-        sprintf(count_str, "%u\r\n", button_press_count);
-        uart_print(count_str);
+        // Should not happen, safety check
+        timer_disable();
+        set_led_output(false);
+        reset_for_new_input();
+        current_app_state = APP_STATE_IDLE;
     }
 }
 
-// Set LED state
-void set_led(bool state) {
-    led_state = state;
-    leds_set(state, 0, 0);
+// --- Helper Function Implementations ---
+void set_led_output(bool on) {
+    led_current_state_on = on; // Always update logical state
+    if (!led_frozen) {    // Check if LED is NOT frozen
+        leds_set(led_current_state_on, 0, 0);
+    }
 }
 
-// Interrupt Service Routine for UART receive
-void uart_rx_isr(uint8_t rx) {
-    // Check if the received character is a printable ASCII character
-    if (rx >= 0x20 && rx <= 0x7E || rx == '\r') { // Only accept printable chars and Enter
-        // Store the received character
-        queue_enqueue(&rx_queue, rx);
-        
-        // If we're currently analyzing, signal that new input is available as soon as any key is pressed
-        // This allows immediate interruption of the analysis
-        if (is_analyzing) {
-            new_input_available = true;
-            uart_print("\r\nNew input detected, stopping current analysis...\r\n");
+void process_received_char(uint8_t c) {
+    if (c == '\b' || c == 0x7F) { // Handle backspace (ASCII DEL for some terminals)
+        if (input_buffer_idx > 0) {
+            input_buffer_idx--;
+            uart_print("\b \b"); // Erase character on terminal
+        }
+    } else if (c >= 0x20 && c < 0x7F) { // Printable characters (excluding DEL)
+        if (input_buffer_idx < BUFF_SIZE - 1) {
+            input_buffer[input_buffer_idx++] = c;
+            uart_tx(c); // Echo character
+        }
+    } else if (c == '\r') { // Enter key
+        // Handled by main logic in RECEIVING_INPUT state
+        // uart_tx(c); // Echo CR
+        // uart_tx('\n'); // Echo LF
+    }
+    input_buffer[input_buffer_idx] = '\0'; // Null-terminate for safety
+}
+
+void filter_and_prepare_number(void) {
+    processed_number_len = 0;
+    continuous_mode_active = false; // Reset for current input processing
+
+    for (uint8_t i = 0; i < input_buffer_idx; ++i) {
+        // Manual check for digit instead of isdigit()
+        if (input_buffer[i] >= '0' && input_buffer[i] <= '9') {
+            if(processed_number_len < BUFF_SIZE -1){
+                 processed_number[processed_number_len++] = input_buffer[i];
+            }
+        }
+        // Check for trailing '-' for continuous mode
+        if (input_buffer[i] == '-' && i == (input_buffer_idx - 1) && processed_number_len > 0) {
+             continuous_mode_active = true;
+             uart_print("Continuous mode detected ('-').\r\n");
+             // Don't add '-' to processed_number
+             break; // Stop processing once '-' is found at the end
         }
     }
+    processed_number[processed_number_len] = '\0';
+}
+
+void initiate_digit_analysis(void) {
+    current_digit_idx = 0;
+    led_should_blink = false; // Reset before first digit analysis
+
+    if (processed_number_len > 0) {
+        perform_current_digit_analysis(); // Analyze the first digit
+        timer_enable(); // Ensure timer is running for subsequent digits/blinking
+    } else {
+        reset_for_new_input();
+        current_app_state = APP_STATE_IDLE;
+    }
+}
+
+void perform_current_digit_analysis(void) {
+    if (current_digit_idx >= processed_number_len) return; // Should be caught earlier
+
+    char digit_char = processed_number[current_digit_idx];
+    int digit = digit_char - '0';
+
+    char msg[30];
+    sprintf(msg, "Analyzing digit %c (%d)...\r\n", digit_char, digit);
+    uart_print(msg);
+
+    if (digit % 2 == 0) { // Even digit
+        uart_print("Even digit - LED will blink.\r\n");
+        led_should_blink = true;
+        led_current_state_on = true; // Start by turning LED on for blink
+        set_led_output(led_current_state_on);
+    } else { // Odd digit
+        uart_print("Odd digit - LED will toggle and stay.\r\n");
+        led_should_blink = false;
+        led_current_state_on = !led_current_state_on; // Toggle previous state
+        set_led_output(led_current_state_on);
+    }
+}
+
+void reset_for_new_input(void) {
+    input_buffer_idx = 0;
+    input_buffer[0] = '\0';
+    processed_number_len = 0;
+    processed_number[0] = '\0';
+    current_digit_idx = 0;
+    led_should_blink = false;
+    continuous_mode_active = false; // Ensure continuous mode is reset
+    uart_char_received_flag = false;
+    new_input_interrupt_flag = false;
+    uint8_t temp_char;
+    while(queue_dequeue(&rx_queue, &temp_char));
 }
